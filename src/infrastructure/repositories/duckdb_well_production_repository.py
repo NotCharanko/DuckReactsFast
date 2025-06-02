@@ -12,7 +12,13 @@ from ...shared.utils.sql_loader import load_sql
 from ...shared.utils.timing_decorator import async_timed, timed
 
 class DuckDBWellProductionRepository(WellProductionRepository):
-    """DuckDB implementation of the well production repository with on-demand CSV export."""
+    """
+    DuckDB implementation of the well production repository.
+    This repository uses a shared DuckDB connection provided during initialization
+    to interact with the 'well_production' table. It handles operations like
+    data insertion (single and bulk), querying, and CSV export.
+    The shared connection is managed externally (e.g., in main.py lifespan).
+    """
     
     # Bulk processing configuration for CSV export
     BATCH_SIZE = 100_000  # Number of records per batch
@@ -22,13 +28,13 @@ class DuckDBWellProductionRepository(WellProductionRepository):
     
     def __init__(
         self, 
-        db_path: Path = Path("data/wells_production.duckdb"), 
+        conn: duckdb.DuckDBPyConnection, # Changed: accept connection object
         sql_path: Path = None,
         downloads_dir: Path = Path("downloads"),
         csv_filename: str = "wells_prod.csv"
     ):
-        self.db_path = db_path
-        self.db_path.parent.mkdir(exist_ok=True)
+        self.conn = conn # Changed: store connection object
+        # self.db_path.parent.mkdir(exist_ok=True) # Removed: DB path managed in main.py
         
         # CSV export configuration
         self.downloads_dir = downloads_dir
@@ -45,45 +51,47 @@ class DuckDBWellProductionRepository(WellProductionRepository):
     
     def _initialize_database(self):
         """Initialize the DuckDB database and create the table if it doesn't exist."""
-        with duckdb.connect(str(self.db_path)) as conn:
-            # Create table
-            conn.execute(self.queries['create_table'])
-            
-            # Create indexes
-            conn.execute(self.queries['create_indexes'])
+        # Use the shared connection
+        self.conn.execute(self.queries['create_table'])
+        self.conn.execute(self.queries['create_indexes'])
     
     async def get_by_well_code(self, well_code: int) -> List[WellProduction]:
         """Get well production data by well code."""
         def _get_by_well_code_sync():
-            with duckdb.connect(str(self.db_path)) as conn:
-                results = conn.execute(
-                    self.queries['get_by_well_code'],
-                    [well_code]
-                ).fetchall()
-                return [self._row_to_entity(row) for row in results]
+            # Use the shared connection
+            results = self.conn.execute(
+                self.queries['get_by_well_code'],
+                [well_code]
+            ).fetchall()
+            return [self._row_to_entity(row) for row in results]
         
         return await asyncio.to_thread(_get_by_well_code_sync)
     
     async def get_by_field_code(self, field_code: int) -> List[WellProduction]:
         """Get all well production data for a field."""
         def _get_by_field_code_sync():
-            with duckdb.connect(str(self.db_path)) as conn:
-                results = conn.execute(
-                    self.queries['get_by_field_code'],
-                    [field_code]
-                ).fetchall()
-                return [self._row_to_entity(row) for row in results]
+            # Use the shared connection
+            results = self.conn.execute(
+                self.queries['get_by_field_code'],
+                [field_code]
+            ).fetchall()
+            return [self._row_to_entity(row) for row in results]
         
         return await asyncio.to_thread(_get_by_field_code_sync)
     
+    # The `save` method, utilizing the 'insert_single' SQL query, performs an "upsert"
+    # operation due to 'INSERT OR REPLACE'. If a record with the same primary key
+    # (well_code, field_code, production_period) exists, it will be overwritten.
+    # This is suitable for scenarios where individual records are updated, and the
+    # latest version should replace any existing version.
     async def save(self, well_production: WellProduction) -> WellProduction:
         """Save well production data."""
         def _save_sync():
-            with duckdb.connect(str(self.db_path)) as conn:
-                conn.execute(
-                    self.queries['insert_single'], 
-                    self._entity_to_params(well_production)
-                )
+            # Use the shared connection
+            self.conn.execute(
+                self.queries['insert_single'],
+                self._entity_to_params(well_production)
+            )
             return well_production
         
         return await asyncio.to_thread(_save_sync)
@@ -97,10 +105,10 @@ class DuckDBWellProductionRepository(WellProductionRepository):
         if not composite_keys:
             return set()
         
-        with duckdb.connect(str(self.db_path)) as conn:
-            # Create a temporary table with the keys to check
-            placeholders = ','.join(['(?, ?, ?)'] * len(composite_keys))
-            query = f"""
+        # Use the shared connection
+        # Create a temporary table with the keys to check
+        placeholders = ','.join(['(?, ?, ?)'] * len(composite_keys))
+        query = f"""
             WITH input_keys AS (
                 VALUES {placeholders}
             )
@@ -113,7 +121,7 @@ class DuckDBWellProductionRepository(WellProductionRepository):
             
             # Flatten the composite keys for the query
             flat_keys = [item for sublist in composite_keys for item in sublist]
-            results = conn.execute(query, flat_keys).fetchall()
+            results = self.conn.execute(query, flat_keys).fetchall() # Use self.conn
             return set(results)
     
     @async_timed
@@ -127,29 +135,35 @@ class DuckDBWellProductionRepository(WellProductionRepository):
         if incoming_df.is_empty():
             return [], 0, 0
 
-        with duckdb.connect(str(self.db_path)) as conn:
-            conn.register('incoming_productions_df', incoming_df)
+        # Use the shared connection
+        self.conn.register('incoming_productions_df', incoming_df)
 
-            count_before = conn.execute("SELECT COUNT(*) FROM well_production").fetchone()[0]
+        count_before = self.conn.execute("SELECT COUNT(*) FROM well_production").fetchone()[0] # Use self.conn
 
-            insert_query = f"""
-            INSERT INTO well_production 
-            SELECT * FROM incoming_productions_df
-            ON CONFLICT (well_code, field_code, production_period) DO NOTHING;
-            """
-            conn.execute(insert_query)
-            
-            count_after = conn.execute("SELECT COUNT(*) FROM well_production").fetchone()[0]
-            
-            new_records_count = count_after - count_before
-            total_incoming = incoming_df.height
-            duplicate_count = total_incoming - new_records_count
+        insert_query = f"""
+        INSERT INTO well_production
+        SELECT * FROM incoming_productions_df
+        ON CONFLICT (well_code, field_code, production_period) DO NOTHING;
+        """
+        self.conn.execute(insert_query) # Use self.conn
 
-            conn.unregister('incoming_productions_df')
+        count_after = self.conn.execute("SELECT COUNT(*) FROM well_production").fetchone()[0] # Use self.conn
+
+        new_records_count = count_after - count_before
+        total_incoming = incoming_df.height
+        duplicate_count = total_incoming - new_records_count
+
+        self.conn.unregister('incoming_productions_df') # Use self.conn (though unregister is on the connection itself)
 
         return [], new_records_count, duplicate_count
     
     @async_timed
+    # The `bulk_insert` method, using an 'ON CONFLICT DO NOTHING' strategy within its
+    # '_bulk_insert_sync' helper, inserts new records and skips any incoming records
+    # that would cause a primary key conflict (i.e., duplicates).
+    # This approach is generally preferred for large data ingestions where efficiency
+    # is key, and skipping existing records is the desired behavior rather than
+    # overwriting them.
     async def bulk_insert(self, incoming_df: pl.DataFrame) -> Tuple[List[WellProduction], int, int]:
         """
         Bulk insert well production data with duplicate detection from a Polars DataFrame.
@@ -162,18 +176,18 @@ class DuckDBWellProductionRepository(WellProductionRepository):
     async def get_all(self) -> List[WellProduction]:
         """Get all well production data."""
         def _get_all_sync():
-            with duckdb.connect(str(self.db_path)) as conn:
-                results = conn.execute(self.queries['get_all']).fetchall()
-                return [self._row_to_entity(row) for row in results]
+            # Use the shared connection
+            results = self.conn.execute(self.queries['get_all']).fetchall()
+            return [self._row_to_entity(row) for row in results]
         
         return await asyncio.to_thread(_get_all_sync)
     
     async def count(self) -> int:
         """Get the total count of well production records."""
         def _count_sync():
-            with duckdb.connect(str(self.db_path)) as conn:
-                result = conn.execute(self.queries['count_all']).fetchone()
-                return result[0] if result else 0
+            # Use the shared connection
+            result = self.conn.execute(self.queries['count_all']).fetchone()
+            return result[0] if result else 0
         
         return await asyncio.to_thread(_count_sync)
     
@@ -223,19 +237,17 @@ class DuckDBWellProductionRepository(WellProductionRepository):
     def _export_to_csv_sync(self) -> Path:
         """Synchronous helper for CSV export operations."""
         try:
-            # Connect to the DuckDB database with optimized settings
-            conn = duckdb.connect(str(self.db_path))
-            
-            # Configure DuckDB for optimal performance
-            conn.execute(f"PRAGMA memory_limit='{self.MEMORY_LIMIT}'")
-            conn.execute(f"PRAGMA threads={self.THREADS}")
+            # Use the shared connection
+            # Configure DuckDB for optimal performance (potentially affects shared connection)
+            self.conn.execute(f"PRAGMA memory_limit='{self.MEMORY_LIMIT}'")
+            self.conn.execute(f"PRAGMA threads={self.THREADS}")
             
             # Get total count for progress tracking
-            total_count = conn.execute("SELECT COUNT(*) FROM well_production").fetchone()[0]
+            total_count = self.conn.execute("SELECT COUNT(*) FROM well_production").fetchone()[0]
             
             if total_count <= self.BATCH_SIZE:
                 # For smaller datasets, export directly with optimized settings
-                conn.execute(f"""
+                self.conn.execute(f"""
                     COPY (
                         SELECT 
                             field_code::VARCHAR as field_code,
@@ -282,7 +294,7 @@ class DuckDBWellProductionRepository(WellProductionRepository):
                     temp_files.append(temp_file)
                     
                     # Export chunk to temporary file
-                    conn.execute(f"""
+                    self.conn.execute(f"""
                         COPY (
                             SELECT 
                                 field_code::VARCHAR as field_code,
@@ -322,7 +334,7 @@ class DuckDBWellProductionRepository(WellProductionRepository):
                         # Clean up temporary file
                         temp_file.unlink()
             
-            conn.close()
+            # conn.close() # Removed: Do not close the shared connection here
             return self.csv_path
             
         except Exception as e:

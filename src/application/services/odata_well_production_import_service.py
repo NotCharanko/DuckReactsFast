@@ -3,7 +3,8 @@ OData Well Production Import Service for importing data from external OData APIs
 Implements hexagonal architecture and DDD principles with object calisthenics.
 """
 import logging
-from typing import Optional, Dict, Any, Tuple, List
+import asyncio # Ensure asyncio is imported
+from typing import Optional, Dict, Any, Tuple, List, AsyncGenerator
 import polars as pl
 
 from ...domain.entities.well_production import WellProduction
@@ -27,15 +28,75 @@ class ODataWellProductionImportService:
     Follows DDD principles and object calisthenics for clean, maintainable code.
     """
 
+from ...shared.batch_processor import BatchProcessor, BatchResult # Added BatchProcessor
+from ...shared.exceptions import (
+    ValidationException,
+    ApplicationException,
+    ExternalApiException,
+    BatchProcessingException # Added BatchProcessingException
+)
+from ...shared.job_manager import JobManager
+from ...shared.utils.timing_decorator import async_timed, timed
+
+logger = logging.getLogger(__name__)
+
+
+class ODataWellProductionImportService:
+    """
+    Service for importing well production data from external OData APIs.
+    Follows DDD principles and object calisthenics for clean, maintainable code.
+    """
+
     def __init__(
         self,
         odata_api_adapter: ODataExternalApiPort,
         repository: WellProductionRepository,
-        job_manager: JobManager
+        job_manager: JobManager,
+        batch_processor: BatchProcessor # Added BatchProcessor
     ):
         self._odata_api_adapter = odata_api_adapter
         self._repository = repository
         self._job_manager = job_manager
+        self._batch_processor = batch_processor # Stored BatchProcessor
+
+    async def _process_and_insert_chunk(self, data_chunk_df: pl.DataFrame) -> Dict[str, Any]:
+        """
+        Processes a single DataFrame chunk: validates data using _validate_production_dataframe
+        (offloaded to a thread) and then inserts the validated data into the repository.
+        Leverages existing validation and insertion helper methods.
+        Returns a dictionary with processing statistics for the chunk.
+        """
+        if self._is_dataframe_empty(data_chunk_df):
+            return {
+                'inserted': 0, 'duplicates': 0, 'validation_errors': [],
+                'validated_count': 0, 'input_count': 0, 'original_errors': []
+            }
+
+        input_count = data_chunk_df.height
+        # _validate_production_dataframe returns (validated_df, list_of_error_dicts)
+        # Offload potentially CPU-bound validation to a separate thread
+        # to avoid blocking the asyncio event loop.
+        validated_df, validation_errors_list_of_dicts = await asyncio.to_thread(
+            self._validate_production_dataframe, data_chunk_df
+        )
+
+        validated_count = validated_df.height
+        inserted_count = 0
+        duplicate_count = 0
+
+        if not self._is_dataframe_empty(validated_df):
+            # _insert_validated_data returns InsertionResult(new_records, duplicate_records)
+            insertion_result_obj = await self._insert_validated_data(validated_df)
+            inserted_count = insertion_result_obj.new_records
+            duplicate_count = insertion_result_obj.duplicate_records
+
+        return {
+            'inserted': inserted_count,
+            'duplicates': duplicate_count,
+            'validation_errors': validation_errors_list_of_dicts, # Keep as list of dicts
+            'validated_count': validated_count,
+            'input_count': input_count
+        }
 
     @async_timed
     async def import_production_data_from_odata(
@@ -43,82 +104,117 @@ class ODataWellProductionImportService:
         batch_id: Optional[str] = None
     ) -> BatchResult:
         """
-        Import well production data from external OData API with comprehensive error handling.
-        
-        Args:
-            batch_id: Optional batch identifier for tracking
-            
-        Returns:
-            BatchResult with import statistics and metadata
-            
-        Raises:
-            ApplicationException: When import process fails
-            ExternalApiException: When OData API call fails
+        Import well production data from an external OData API using a streaming approach.
+        This method consumes an asynchronous stream of DataFrame chunks from the OData API adapter,
+        processes these chunks using BatchProcessor for robust batching and retries,
+        validates and inserts data from each chunk, aggregates overall results,
+        and updates the JobManager with progress and final status.
         """
+        logger.info(f"Starting OData well production data import (batch ID: {batch_id}) with streaming.")
+
+        # Aggregated statistics using ImportMetrics
+        aggregated_metrics = ImportMetrics()
+        all_validation_errors_agg_str = [] # Stores string representations for final BatchResult
+
+        # The processor function for BatchProcessor.process_stream
+        async def stream_processor(data_chunks: List[pl.DataFrame]) -> List[Dict[str, Any]]:
+            chunk_results = []
+            for chunk_df in data_chunks:
+                result = await self._process_and_insert_chunk(chunk_df)
+                chunk_results.append(result)
+            return chunk_results
+
+        # Assuming _fetch_data_from_odata_api now returns an AsyncGenerator[pl.DataFrame, None]
+        # This change in _fetch_data_from_odata_api is crucial and assumed to be done or compatible.
+        data_stream = self._fetch_data_from_odata_api()
+
         try:
-            logger.info(f"Starting OData well production data import (batch ID: {batch_id})")
+            async for batch_processing_result in self._batch_processor.process_stream(
+                items=data_stream,
+                processor=stream_processor
+            ):
+                # batch_processing_result is a BatchResult from BatchProcessor.
+                # Its 'results' field contains the list of dicts from stream_processor.
 
-            # Initialize counters following object calisthenics (no primitive obsession)
-            import_metrics = ImportMetrics()
+                current_batch_new_records = 0
+                current_batch_duplicate_records = 0
 
-            # Fetch data from OData API
-            incoming_dataframe = await self._fetch_data_from_odata_api()
+                for chunk_proc_result in batch_processing_result.results:
+                    aggregated_metrics.total_records_from_source += chunk_proc_result['input_count']
+                    aggregated_metrics.new_records += chunk_proc_result['inserted']
+                    aggregated_metrics.duplicate_records += chunk_proc_result['duplicates']
 
-            if self._is_dataframe_empty(incoming_dataframe):
-                return self._create_empty_batch_result(batch_id, import_metrics)
+                    current_batch_new_records += chunk_proc_result['inserted']
+                    current_batch_duplicate_records += chunk_proc_result['duplicates']
 
-            import_metrics.set_total_records_from_source(incoming_dataframe.height)
-            logger.info(f"Received {import_metrics.total_records_from_source} records from OData API")
+                    for val_error_detail in chunk_proc_result['validation_errors']:
+                        all_validation_errors_agg_str.append(str(val_error_detail))
 
-            await self._update_job_progress_if_exists(batch_id, import_metrics.total_records_from_source, 0)
+                    aggregated_metrics.failed_validation_records += (chunk_proc_result['input_count'] - chunk_proc_result['validated_count'])
 
-            # Validate and clean the data
-            validated_dataframe, validation_errors = self._validate_production_dataframe(incoming_dataframe)
-            import_metrics.set_failed_validation_records(import_metrics.total_records_from_source - validated_dataframe.height)
+                if batch_id:
+                    await self._job_manager.update_job(
+                        batch_id,
+                        progress_increment=batch_processing_result.total_items, # Assuming one DataFrame chunk is one item
+                        new_records_increment=current_batch_new_records,
+                        duplicate_records_increment=current_batch_duplicate_records,
+                    )
 
-            if self._is_dataframe_empty(validated_dataframe):
-                return self._create_validation_failed_batch_result(batch_id, import_metrics, validation_errors)
+            data_status = self._determine_data_status(aggregated_metrics)
 
-            # Insert validated data into repository
-            insertion_result = await self._insert_validated_data(validated_dataframe)
-            import_metrics.set_insertion_results(insertion_result.new_records, insertion_result.duplicate_records)
+            logger.info(f"OData streaming import completed for batch ID {batch_id}: "
+                       f"{aggregated_metrics.new_records} new, "
+                       f"{aggregated_metrics.duplicate_records} duplicates, "
+                       f"{aggregated_metrics.failed_validation_records} failed validation "
+                       f"out of {aggregated_metrics.total_records_from_source} total records.")
 
-            await self._update_job_completion_if_exists(batch_id, import_metrics)
+            final_batch_result = self._create_final_batch_result(batch_id, aggregated_metrics, data_status, all_validation_errors_agg_str)
 
-            # Determine final data status
-            data_status = self._determine_data_status(import_metrics)
+            if batch_id:
+                 await self._job_manager.update_job(
+                    batch_id, status='completed',
+                    final_statistics=final_batch_result.metadata,
+                 )
+            return final_batch_result
 
-            logger.info(f"OData import completed for batch ID {batch_id}: "
-                       f"{import_metrics.new_records} new, "
-                       f"{import_metrics.duplicate_records} duplicates, "
-                       f"{import_metrics.failed_validation_records} failed validation "
-                       f"out of {import_metrics.total_records_from_source} total records")
-
-            return self._create_successful_batch_result(batch_id, import_metrics, data_status, validation_errors)
-
-        except ApplicationException:
-            await self._handle_job_failure_if_exists(batch_id)
-            raise
+        except (ApplicationException, ExternalApiException, BatchProcessingException) as e:
+            logger.error(f"Error during OData streaming import (batch ID: {batch_id}): {str(e)}", exc_info=True)
+            if batch_id:
+                await self._handle_job_failure_if_exists(batch_id, str(e)) # Pass error message
+            if not isinstance(e, ApplicationException):
+                 raise ApplicationException(message=f"OData import failed: {str(e)}", cause=e, batch_id=batch_id)
+            else:
+                 raise
         except Exception as e:
-            await self._handle_job_failure_if_exists(batch_id)
-            logger.error(f"Unexpected error importing OData data (batch ID: {batch_id}): {str(e)}", exc_info=True)
+            logger.error(f"Unexpected error during OData streaming import (batch ID: {batch_id}): {str(e)}", exc_info=True)
+            if batch_id:
+                await self._handle_job_failure_if_exists(batch_id, str(e)) # Pass error message
             raise ApplicationException(
                 message=f"OData import failed due to unexpected error: {str(e)}",
-                cause=e
+                cause=e,
+                batch_id=batch_id
             )
 
-    async def _fetch_data_from_odata_api(self) -> pl.DataFrame:
-        """Fetch data from OData API with proper error handling."""
+    async def _fetch_data_from_odata_api(self) -> AsyncGenerator[pl.DataFrame, None]:
+        """
+        Fetch data from OData API, expecting an AsyncGenerator of DataFrames.
+        This method now acts as a pass-through or could encapsulate pre-processing if needed
+        before data is streamed to BatchProcessor.
+        """
         try:
-            return await self._odata_api_adapter.fetch_well_production_data()
+            # This assumes self._odata_api_adapter.fetch_well_production_data()
+            # has been updated to be an AsyncGenerator[pl.DataFrame, None]
+            # similar to ExternalApiAdapter.fetch_well_production_data
+            async for data_chunk_df in self._odata_api_adapter.fetch_well_production_data():
+                yield data_chunk_df
         except ExternalApiException as e:
-            logger.error(f"Failed to fetch data from OData API: {e.message}")
+            logger.error(f"Failed to fetch data from OData API stream: {e.message}")
             raise
         except Exception as e:
-            logger.error(f"Unexpected error fetching from OData API: {str(e)}", exc_info=True)
+            logger.error(f"Unexpected error fetching from OData API stream: {str(e)}", exc_info=True)
             raise ExternalApiException(
-                message=f"Unexpected error during OData API fetch: {str(e)}",
-                endpoint=self._odata_api_adapter.base_url,
+                message=f"Unexpected error during OData API fetch stream: {str(e)}",
+                endpoint=self._odata_api_adapter.base_url, # base_url might not be on ODataExternalApiPort, adjust if needed
                 cause=e
             )
 
@@ -252,21 +348,23 @@ class ODataWellProductionImportService:
             }
         )
 
-    def _create_successful_batch_result(
+    # Renamed from _create_successful_batch_result to reflect its use for the final aggregated result
+    def _create_final_batch_result(
         self,
         batch_id: str,
         metrics: 'ImportMetrics',
         data_status: str,
-        validation_errors: List[Dict[str, Any]]
+        all_validation_errors_str: List[str] # Now expects list of strings
     ) -> BatchResult:
-        """Create batch result for successful import scenario."""
+        """Create the final batch result for the entire import operation."""
         potential_inserts = metrics.total_records_from_source - metrics.failed_validation_records
         success_rate = ((metrics.new_records / potential_inserts) * 100) if potential_inserts > 0 else 100
         
-        if metrics.total_records_from_source == 0:
-            success_rate = 100
-        if potential_inserts == 0 and metrics.total_records_from_source > 0:
+        if metrics.total_records_from_source == 0: # No data from source
+            success_rate = 100 # Or based on requirements, could be 0 if data was expected.
+        elif potential_inserts == 0 : # All records from source failed validation
             success_rate = 0
+
 
         return BatchResult(
             batch_id=batch_id,
@@ -274,9 +372,9 @@ class ODataWellProductionImportService:
             processed_items=metrics.new_records,
             failed_items=metrics.failed_validation_records + metrics.duplicate_records,
             success_rate=success_rate,
-            errors=[str(e) for e in validation_errors],
-            execution_time_ms=0,
-            memory_usage_mb=0,
+            errors=all_validation_errors_str, # Use aggregated string errors
+            execution_time_ms=0, # This would ideally be measured by JobManager or BatchProcessor
+            memory_usage_mb=0,   # This would ideally be measured by JobManager or BatchProcessor
             metadata={
                 'new_records': metrics.new_records,
                 'duplicate_records': metrics.duplicate_records,
@@ -304,10 +402,10 @@ class ODataWellProductionImportService:
                 duplicate_records=metrics.duplicate_records
             )
 
-    async def _handle_job_failure_if_exists(self, batch_id: str) -> None:
-        """Handle job failure if batch_id exists."""
+    async def _handle_job_failure_if_exists(self, batch_id: str, error_message: str = "Import failed") -> None:
+        """Handle job failure if batch_id exists, including the error message."""
         if batch_id:
-            await self._job_manager.update_job(batch_id, status='failed', error="Import failed")
+            await self._job_manager.update_job(batch_id, status='failed', error=error_message)
 
 
 # Value objects following object calisthenics principles

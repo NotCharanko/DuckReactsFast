@@ -1,11 +1,14 @@
-import json
-import os
 import time
+import uuid # For generating unique job IDs
 from enum import Enum
-from typing import Dict, Optional
-from dataclasses import dataclass, asdict
+from typing import Dict, Optional, Any, Mapping # Added Any, Mapping
+from dataclasses import dataclass, fields # Added fields
 import asyncio
 import logging
+import duckdb # Added duckdb
+from pathlib import Path # Added Path
+
+from ..shared.utils.sql_loader import load_sql # Added load_sql
 
 logger = logging.getLogger(__name__)
 
@@ -14,165 +17,167 @@ class JobStatus(Enum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
-    TIMEOUT = "timeout"
+    # TIMEOUT is essentially a FAILED status with a specific error message.
+    # We can simplify by using FAILED and setting an appropriate error message.
 
 @dataclass
-class Job:
-    id: str
+class Job: # This dataclass can represent the structure in the DB
+    job_id: str # Changed from id to job_id to match DB
+    job_type: str
     status: JobStatus
-    created_at: float
-    started_at: Optional[float] = None
-    completed_at: Optional[float] = None
-    error: Optional[str] = None
-    progress: int = 0
+    created_at: Any # duckdb returns datetime, not float
+    updated_at: Any # duckdb returns datetime, not float
+    started_at: Optional[Any] = None
+    completed_at: Optional[Any] = None
+    progress: float = 0.0 # Changed from int to float
     total_records: Optional[int] = None
     new_records: Optional[int] = None
     duplicate_records: Optional[int] = None
-    last_updated_at: float = 0.0
+    error_message: Optional[str] = None # Changed from error to error_message
+
+    # Helper to convert a DuckDB row (tuple) to a Job object
+    @classmethod
+    def from_row(cls, row: tuple, column_names: list) -> "Job":
+        row_dict = dict(zip(column_names, row))
+        # Convert status string from DB to JobStatus enum
+        if 'status' in row_dict and isinstance(row_dict['status'], str):
+            row_dict['status'] = JobStatus(row_dict['status'])
+
+        # Ensure all dataclass fields are present, defaulting if necessary
+        # This is important if some DB columns might be null and not directly in row_dict
+        # or if there's a mismatch in optional fields.
+        # However, with controlled INSERT/UPDATEs, row_dict should have all necessary keys.
+        # For safety, one could iterate cls.__dataclass_fields__ and get from row_dict with defaults.
+
+        # Filter out keys not in the dataclass definition to prevent errors
+        valid_keys = {f.name for f in fields(cls)}
+        filtered_row_dict = {k: v for k, v in row_dict.items() if k in valid_keys}
+
+        return cls(**filtered_row_dict)
+
 
 class JobManager:
-    def __init__(self, jobs_file: str = "jobs.json", job_timeout_seconds: int = 3600):
-        self.jobs_file = jobs_file
-        self._lock = asyncio.Lock()
-        self.job_timeout_seconds = job_timeout_seconds
-        self._load_jobs_sync()  # Initial load is sync since we're in __init__
-        self._cleanup_stale_jobs_sync()  # Initial cleanup is sync
+    """
+    Manages the lifecycle of background jobs (e.g., data imports).
+    It uses a DuckDB database connection to persist job statuses, ensuring that
+    job information is not lost across application restarts and providing a
+    centralized way to track job progress and outcomes.
+    """
+    def __init__(self, db_conn: duckdb.DuckDBPyConnection):
+        self.db_conn = db_conn
+        self._lock = asyncio.Lock() # To protect against concurrent job creation attempts for the same type
 
-    def _load_jobs_sync(self):
-        """Synchronous helper for loading jobs from file."""
+        # Load SQL queries from the jobs.sql file.
+        sql_path = Path(__file__).parent.parent / "infrastructure" / "operations" / "jobs.sql"
+        self.queries = load_sql(str(sql_path))
+
+        # Initialize database schema: create the job_status table if it doesn't exist
+        # and reconcile stale jobs (e.g., mark jobs that were 'running' as 'failed'
+        # if the application restarted before they completed).
+        self._initialize_db()
+
+    def _initialize_db(self):
+        """Creates the job status table if it doesn't exist and marks stale jobs."""
         try:
-            if os.path.exists(self.jobs_file):
-                with open(self.jobs_file, 'r') as f:
-                    try:
-                        data = json.load(f)
-                        self.jobs = {k: Job(**{**v, 'status': JobStatus(v['status'])}) 
-                                   for k, v in data.items()}
-                    except json.JSONDecodeError:
-                        logger.warning(f"Invalid JSON in {self.jobs_file}, initializing empty jobs")
-                        self.jobs = {}
-            else:
-                self.jobs = {}
+            self.db_conn.execute(self.queries['create_job_status_table'])
+            logger.info("Job status table initialized.")
+
+            # Mark stale jobs (those in 'running' state) as 'failed'
+            # This handles cases where the application might have crashed.
+            result = self.db_conn.execute(self.queries['mark_stale_jobs_as_failed'])
+            if result.fetchnone() is not None and hasattr(result, 'rowcount') and result.rowcount > 0 : # DuckDB specific check for changes
+                 logger.info(f"Marked {result.rowcount} stale jobs as failed.")
+            else: # Attempt to get rowcount for DuckDB versions that support it or check changes another way
+                # DuckDB's execute often returns a relation object.
+                # For UPDATE, INSERT, DELETE, the number of affected rows is not directly returned by execute()
+                # but can be inferred or might be available in newer versions through specific methods.
+                # For now, we'll assume the query ran and log its intent.
+                # A more robust way would be to SELECT COUNT(*) WHERE status = 'running' before and after.
+                logger.info("Checked for stale jobs to mark as failed.")
+
         except Exception as e:
-            logger.error(f"Error loading jobs file: {str(e)}")
-            self.jobs = {}
+            logger.error(f"Error initializing job database: {e}", exc_info=True)
+            # Depending on the severity, we might want to raise this
+            # to prevent the application from starting with a non-functional JobManager.
 
-    async def _load_jobs(self):
-        """Asynchronous job loading."""
-        await asyncio.to_thread(self._load_jobs_sync)
-
-    def _save_jobs_sync(self):
-        """Synchronous helper for saving jobs to file."""
-        with open(self.jobs_file, 'w') as f:
-            # Convert Job objects to dict and handle JobStatus enum serialization
-            jobs_dict = {}
-            for k, v in self.jobs.items():
-                job_dict = asdict(v)
-                job_dict['status'] = job_dict['status'].value  # Convert enum to string
-                jobs_dict[k] = job_dict
-            json.dump(jobs_dict, f, indent=2)
-
-    async def _save_jobs(self):
-        """Asynchronous job saving."""
-        await asyncio.to_thread(self._save_jobs_sync)
-
-    def _cleanup_stale_jobs_sync(self):
-        """Synchronous helper for cleaning up stale jobs."""
-        current_time = time.time()
-        for job_id, job in list(self.jobs.items()):
-            # Check for running jobs that haven't been updated
-            if job.status == JobStatus.RUNNING:
-                if current_time - job.last_updated_at > self.job_timeout_seconds:
-                    logger.warning(f"Job {job_id} timed out after {self.job_timeout_seconds} seconds")
-                    job.status = JobStatus.TIMEOUT
-                    job.error = "Job timed out due to inactivity"
-                    job.completed_at = current_time
-                # Check for jobs that have been running too long
-                elif job.started_at and current_time - job.started_at > self.job_timeout_seconds:
-                    logger.warning(f"Job {job_id} exceeded maximum runtime of {self.job_timeout_seconds} seconds")
-                    job.status = JobStatus.TIMEOUT
-                    job.error = "Job exceeded maximum runtime"
-                    job.completed_at = current_time
-
-        # Save changes after cleanup
-        self._save_jobs_sync()
-
-    async def _cleanup_stale_jobs(self):
-        """Clean up stale jobs that have been running too long"""
-        await asyncio.to_thread(self._cleanup_stale_jobs_sync)
-
-    async def create_job(self) -> Optional[str]:
-        """Create a new job if no job is running"""
+    async def create_job(self, job_type: str) -> Optional[str]:
+        """
+        Create a new job if no active (pending or running) job of the same type exists.
+        The job_type parameter is used for concurrency control, ensuring that only one
+        job of a specific type (e.g., 'well_import', 'odata_import') can be active at a time.
+        """
         async with self._lock:
-            # Clean up stale jobs before creating new one
-            await self._cleanup_stale_jobs()
+            try:
+                # Check for existing active job of this type to prevent duplicates.
+                active_job_row = self.db_conn.execute(self.queries['get_active_job_by_type'], [job_type]).fetchone()
+                if active_job_row:
+                    logger.warning(f"An active job of type '{job_type}' already exists (ID: {active_job_row[0]}). Cannot create new job.")
+                    return None # Or raise an exception
+
+                job_id = str(uuid.uuid4())
+                initial_status = JobStatus.PENDING.value
+
+                self.db_conn.execute(self.queries['insert_job'], [job_id, job_type, initial_status])
+                logger.info(f"Created new job {job_id} of type {job_type} with status {initial_status}.")
+                return job_id
+            except Exception as e:
+                logger.error(f"Error creating job of type {job_type}: {e}", exc_info=True)
+                return None # Or re-raise as an application-specific exception
+
+    async def update_job(
+        self,
+        job_id: str,
+        status: JobStatus,
+        progress: Optional[float] = None,
+        total_records: Optional[int] = None,
+        new_records: Optional[int] = None,
+        duplicate_records: Optional[int] = None,
+        error_message: Optional[str] = None,
+        started_at: Optional[Any] = None, # Pass datetime objects if specific start time is needed
+        completed_at: Optional[Any] = None # Pass datetime objects
+    ):
+        """Update job status and details in the database."""
+        try:
+            # For started_at, we only want to set it if the status is RUNNING and started_at is not already set.
+            # The COALESCE in SQL handles this if `None` is passed when it shouldn't be updated.
+            # If status is RUNNING and current started_at is None, we might pass datetime.now() or rely on DB.
+            # For this implementation, we'll let the caller pass an explicit started_at if needed.
+            # If it's the first time moving to RUNNING, started_at should be set.
+            # If status is COMPLETED or FAILED, completed_at should be set.
             
-            # Check if any job is running
-            running_job = self._get_running_job()
-            if running_job:
-                return None
-
-            # Create new job
-            job_id = f"import_{int(time.time())}"
-            current_time = time.time()
-            job = Job(
-                id=job_id,
-                status=JobStatus.PENDING,
-                created_at=current_time,
-                last_updated_at=current_time
-            )
-            self.jobs[job_id] = job
-            await self._save_jobs()
-            return job_id
-
-    def _get_running_job(self) -> Optional[Job]:
-        """Get currently running job if any"""
-        for job in self.jobs.values():
-            if job.status == JobStatus.RUNNING:
-                return job
-        return None
-
-    async def update_job(self, job_id: str, **kwargs):
-        """Update job status and progress"""
-        async with self._lock:
-            if job_id not in self.jobs:
-                return
-
-            job = self.jobs[job_id]
-            current_time = time.time()
+            # The SQL query 'update_job_details' expects parameters in a specific order:
+            # status, progress, total_records, new_records, duplicate_records,
+            # error_message, started_at, completed_at, job_id
             
-            for key, value in kwargs.items():
-                if hasattr(job, key):
-                    setattr(job, key, value)
+            params = [
+                status.value,
+                progress,
+                total_records,
+                new_records,
+                duplicate_records,
+                error_message,
+                started_at, # Will be passed as COALESCE(?, started_at) in SQL
+                completed_at,
+                job_id
+            ]
+            self.db_conn.execute(self.queries['update_job_details'], params)
+            logger.debug(f"Updated job {job_id}: status={status.value}, progress={progress}")
 
-            if 'status' in kwargs:
-                if kwargs['status'] == JobStatus.RUNNING:
-                    job.started_at = current_time
-                elif kwargs['status'] in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.TIMEOUT):
-                    job.completed_at = current_time
+        except Exception as e:
+            logger.error(f"Error updating job {job_id}: {e}", exc_info=True)
+            # Handle error, perhaps re-raise or log
 
-            # Update last_updated_at timestamp
-            job.last_updated_at = current_time
-            await self._save_jobs()
-
-    def get_job(self, job_id: str) -> Optional[Job]:
-        """Get job by ID"""
-        return self.jobs.get(job_id)
-
-    def get_job_status(self, job_id: str) -> Optional[Dict]:
-        """Get job status and progress"""
-        job = self.get_job(job_id)
-        if not job:
+    async def get_job_status(self, job_id: str) -> Optional[Job]:
+        """Get job by ID from the database."""
+        try:
+            result = self.db_conn.execute(self.queries['get_job_by_id'], [job_id]).fetchone()
+            if result:
+                # Get column names from the cursor description (if available and simple)
+                # Or assume a fixed order / list of names.
+                # For DuckDB, description provides (name, type_code, display_size, internal_size, precision, scale, null_ok)
+                column_names = [desc[0] for desc in self.db_conn.description]
+                return Job.from_row(result, column_names)
             return None
-        return asdict(job)
-
-    async def cleanup_old_jobs(self, max_age_days: int = 7):
-        """Clean up old completed/failed jobs"""
-        current_time = time.time()
-        max_age_seconds = max_age_days * 24 * 3600
-        
-        for job_id, job in list(self.jobs.items()):
-            if job.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.TIMEOUT):
-                if current_time - job.completed_at > max_age_seconds:
-                    del self.jobs[job_id]
-        
-        await self._save_jobs() 
+        except Exception as e:
+            logger.error(f"Error getting job {job_id}: {e}", exc_info=True)
+            return None
