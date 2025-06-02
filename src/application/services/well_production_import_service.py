@@ -1,5 +1,5 @@
 import logging
-# asyncio and concurrent.futures removed
+import asyncio # Ensure asyncio is imported
 from typing import List, Optional, Dict, Any, Tuple, AsyncGenerator
 import pandas as pd # Will be removed if validation fully moves to Polars
 from dataclasses import asdict # Will be removed if validation fully moves to Polars
@@ -31,157 +31,191 @@ class WellProductionImportService:
         self,
         external_api: ExternalApiAdapter,
         repository: WellProductionRepository,
-        job_manager: JobManager
+        job_manager: JobManager,
+        batch_processor: BatchProcessor # Added batch_processor
     ):
         self.external_api = external_api
         self.repository = repository
         self.job_manager = job_manager
-        # Track import statistics across batches
-        # These stats are reset per call to import_production_data, which is correct.
-        # self._import_stats can be removed if stats are handled locally within import_production_data
+        self.batch_processor = batch_processor # Stored batch_processor
 
-    @async_timed # Added decorator
+    async def _process_and_insert_chunk(self, data_chunk_df: pl.DataFrame) -> Dict[str, Any]:
+        """
+        Processes a single DataFrame chunk: validates data using _validate_production_data_df
+        (offloaded to a thread) and then inserts the validated data into the repository.
+        Returns a dictionary with processing statistics for the chunk.
+        """
+        if data_chunk_df is None or data_chunk_df.is_empty():
+            return {
+                'inserted': 0, 'duplicates': 0, 'validation_errors': [],
+                'validated_count': 0, 'input_count': 0
+            }
+
+        input_count = data_chunk_df.height
+        # Offload potentially CPU-bound validation to a separate thread
+        # to avoid blocking the asyncio event loop.
+        valid_df, validation_errors = await asyncio.to_thread(self._validate_production_data_df, data_chunk_df)
+
+        validated_count = valid_df.height
+        inserted_count = 0
+        duplicate_count = 0
+
+        if not valid_df.is_empty():
+            _, inserted_count, duplicate_count = await self.repository.bulk_insert(valid_df)
+
+        return {
+            'inserted': inserted_count,
+            'duplicates': duplicate_count,
+            'validation_errors': validation_errors,
+            'validated_count': validated_count,
+            'input_count': input_count
+        }
+
+    @async_timed
     async def import_production_data(
         self,
         filters: Optional[Dict[str, Any]] = None,
         batch_id: str = None
     ) -> BatchResult:
         """
-        Import well production data from external source with batch processing.
-        Assumes external_api.fetch_well_production_data now returns a Polars DataFrame.
-        Handles validation and batch insertion of data using Polars DataFrames.
+        Import well production data from an external source using a streaming approach.
+        This method consumes an asynchronous stream of DataFrame chunks from an external API adapter,
+        processes these chunks using BatchProcessor for robust batching and retries,
+        validates and inserts data from each chunk, aggregates overall results,
+        and updates the JobManager with progress and final status.
         """
+        logger.info(f"Starting well production data import (batch ID: {batch_id}) with streaming.")
+
+        # Aggregated statistics
+        total_records_from_source_agg = 0
+        total_new_records_inserted_agg = 0
+        total_duplicate_records_skipped_agg = 0
+        total_failed_validation_records_agg = 0
+        all_validation_errors_agg = [] # Stores string representations of errors
+
+        # The processor function for BatchProcessor.process_stream
+        # It receives a list of items (DataFrames in this case)
+        async def stream_processor(data_chunks: List[pl.DataFrame]) -> List[Dict[str, Any]]:
+            chunk_results = []
+            for chunk_df in data_chunks:
+                result = await self._process_and_insert_chunk(chunk_df)
+                chunk_results.append(result)
+            return chunk_results
+
+        data_stream = self.external_api.fetch_well_production_data(filters=filters)
+        processed_item_count_for_job_update = 0
+
         try:
-            logger.info(f"Starting well production data import (batch ID: {batch_id})")
+            async for batch_processing_result in self.batch_processor.process_stream(
+                items=data_stream, # AsyncGenerator[pl.DataFrame, None]
+                processor=stream_processor # Callable[[List[pl.DataFrame]], Coroutine[Any, Any, List[Dict[str, Any]]]]
+            ):
+                # batch_processing_result is a BatchResult from BatchProcessor
+                # Its 'results' field contains the list of dicts from stream_processor
 
-            total_new_records_inserted = 0
-            total_duplicate_records_skipped = 0
-            total_failed_validation_records = 0
-            all_validation_errors = [] 
+                # Aggregate stats from this batch
+                for chunk_proc_result in batch_processing_result.results:
+                    total_records_from_source_agg += chunk_proc_result['input_count']
+                    total_new_records_inserted_agg += chunk_proc_result['inserted']
+                    total_duplicate_records_skipped_agg += chunk_proc_result['duplicates']
 
-            # fetch_well_production_data now returns a Polars DataFrame from ExternalApiAdapter
-            incoming_df = await self.external_api.fetch_well_production_data(filters)
+                    # Errors from _validate_production_data_df are lists of dicts
+                    # Convert them to strings for the final BatchResult error list
+                    for val_error_detail in chunk_proc_result['validation_errors']:
+                        all_validation_errors_agg.append(str(val_error_detail)) # Or format more nicely
 
-            if incoming_df is None or incoming_df.is_empty():
-                logger.info(f"No data returned from external API for batch ID: {batch_id}")
-                return BatchResult(
-                    batch_id=batch_id, total_items=0, processed_items=0, failed_items=0,
-                    success_rate=100, errors=[], execution_time_ms=0, memory_usage_mb=0,
-                    metadata={'data_status': 'no_data_from_source'}
-                )
+                    # Failed validation is input_count - validated_count
+                    total_failed_validation_records_agg += (chunk_proc_result['input_count'] - chunk_proc_result['validated_count'])
 
-            total_records_from_source = incoming_df.height
-            logger.info(f"Received {total_records_from_source} records from external API (batch ID: {batch_id}) as Polars DataFrame.")
+                processed_item_count_for_job_update += batch_processing_result.total_items # total_items processed by this BatchProcessor batch
 
-            if batch_id:
-                await self.job_manager.update_job(
-                    batch_id,
-                    total_records=total_records_from_source,
-                    progress=0 # Initial progress
-                )
-            
-            # Validate the entire DataFrame. 
-            # _validate_production_data_df will be refactored to accept Polars DF 
-            # and return a tuple: (validated_polars_df, list_of_error_dicts)
-            valid_df, validation_errors_for_df = self._validate_production_data_df(incoming_df)
-            
-            if validation_errors_for_df:
-                all_validation_errors.extend(validation_errors_for_df)
-            
-            total_failed_validation_records = total_records_from_source - valid_df.height
-            if total_failed_validation_records > 0:
-                 logger.warning(f"{total_failed_validation_records} records failed validation for batch ID {batch_id}.")
-
-            if valid_df.is_empty():
-                logger.info(f"No valid records after validation for batch ID: {batch_id}. Total from source: {total_records_from_source}")
                 if batch_id:
+                    # Job manager update:
+                    # total_records for job manager could be an estimate or updated as we go.
+                    # For now, let's assume we don't know the grand total upfront with streaming.
+                    # We can update progress based on processed items if total is known,
+                    # or just log incremental updates.
                     await self.job_manager.update_job(
-                        batch_id, progress=100, 
-                        new_records=0, duplicate_records=0,
-                        # We can add 'failed_validation_records': total_failed_validation_records to job metadata here
+                        batch_id,
+                        # total_records=???, # This is tricky with true streaming
+                        progress_increment=batch_processing_result.total_items, # Number of DataFrames processed in this batch
+                        # Or, if BatchProcessor's total_items means something else (e.g. rows if it could see inside DataFrames)
+                        # We need to be careful about what 'total_items' means for BatchProcessor with DataFrame inputs.
+                        # For now, assume one DataFrame is one item for BatchProcessor.
+                        new_records_increment=sum(r['inserted'] for r in batch_processing_result.results),
+                        duplicate_records_increment=sum(r['duplicates'] for r in batch_processing_result.results),
+                        # We might need a 'failed_validation_increment' too
                     )
-                return BatchResult(
-                    batch_id=batch_id, total_items=total_records_from_source, 
-                    processed_items=0, failed_items=total_failed_validation_records,
-                    success_rate=0, errors=[str(e) for e in all_validation_errors], 
-                    execution_time_ms=0, memory_usage_mb=0,
-                    metadata={
-                        'new_records': 0, 'duplicate_records': 0,
-                        'failed_validation_records': total_failed_validation_records,
-                        'data_status': 'all_failed_validation' if total_records_from_source > 0 else 'no_data_from_source'
-                    }
-                )
-
-            # At this point, valid_df contains only rows that passed schema and rule validation.
-            # Now, pass this Polars DataFrame to the repository's bulk_insert method.
-            # The repository's bulk_insert is already refactored to accept a Polars DataFrame.
             
-            # The first element of the tuple (list of WellProduction entities) is [] due to performance reasons.
-            _, inserted_count, duplicate_count = await self.repository.bulk_insert(valid_df)
-            
-            total_new_records_inserted = inserted_count
-            total_duplicate_records_skipped = duplicate_count
-
-            if batch_id:
-                await self.job_manager.update_job(
-                    batch_id, progress=100, # Mark as 100% processed
-                    new_records=total_new_records_inserted,
-                    duplicate_records=total_duplicate_records_skipped
-                )
-
-            # Determine overall data status
-            data_status = 'no_new_data'
-            if total_new_records_inserted > 0:
+            if total_records_from_source_agg == 0:
+                 logger.info(f"No data streamed from external API for batch ID: {batch_id}")
+                 data_status = 'no_data_from_source'
+            elif total_new_records_inserted_agg > 0:
                 data_status = 'updated'
-            # If all valid records were duplicates
-            elif valid_df.height > 0 and total_duplicate_records_skipped == valid_df.height:
-                 data_status = 'no_new_data_all_duplicates'
-            elif total_records_from_source > 0 and total_failed_validation_records == total_records_from_source:
+            elif total_failed_validation_records_agg == total_records_from_source_agg : # All records failed validation
                 data_status = 'all_failed_validation'
-            elif total_records_from_source == 0:
-                data_status = 'no_data_from_source'
-                
-            # Calculate success rate based on valid items that were intended for insertion
-            potential_inserts = valid_df.height
-            success_rate = ((total_new_records_inserted / potential_inserts) * 100) if potential_inserts > 0 else 100
-            if total_records_from_source == 0: success_rate = 100 
-            if potential_inserts == 0 and total_records_from_source > 0 : success_rate = 0
+            elif total_duplicate_records_skipped_agg == (total_records_from_source_agg - total_failed_validation_records_agg) and (total_records_from_source_agg - total_failed_validation_records_agg) > 0 : # All valid records were duplicates
+                data_status = 'no_new_data_all_duplicates'
+            else: # Default if none of the above specific statuses fit
+                data_status = 'processed_with_mixed_results'
 
-            logger.info(f"Import completed for batch ID {batch_id}: "
-                        f"{total_new_records_inserted} new, "
-                        f"{total_duplicate_records_skipped} duplicates (from {potential_inserts} valid records), "
-                        f"{total_failed_validation_records} failed validation "
-                        f"out of {total_records_from_source} total records from source.")
 
-            return BatchResult(
+            # Final success rate calculation
+            # Total "attempted" inserts are records that passed validation
+            attempted_inserts = total_records_from_source_agg - total_failed_validation_records_agg
+            success_rate = (total_new_records_inserted_agg / attempted_inserts * 100) if attempted_inserts > 0 else 100
+            if total_records_from_source_agg == 0 : success_rate = 100 # No data, so 100% success? Or 0%?
+            if attempted_inserts == 0 and total_records_from_source_agg > 0: success_rate = 0
+
+
+            logger.info(f"Streaming import completed for batch ID {batch_id}: "
+                        f"{total_new_records_inserted_agg} new, "
+                        f"{total_duplicate_records_skipped_agg} duplicates, "
+                        f"{total_failed_validation_records_agg} failed validation "
+                        f"out of {total_records_from_source_agg} total records from source.")
+
+            final_batch_result = BatchResult(
                 batch_id=batch_id,
-                total_items=total_records_from_source,
-                processed_items=total_new_records_inserted,
-                failed_items=total_failed_validation_records + total_duplicate_records_skipped, 
+                total_items=total_records_from_source_agg,
+                processed_items=total_new_records_inserted_agg,
+                failed_items=total_failed_validation_records_agg + total_duplicate_records_skipped_agg,
                 success_rate=success_rate,
-                errors=[str(e) for e in all_validation_errors],
-                execution_time_ms=0, # To be filled by caller or job manager
-                memory_usage_mb=0,   # To be filled by caller or job manager
+                errors=all_validation_errors_agg,
+                # execution_time_ms and memory_usage_mb would ideally be measured by the BatchProcessor or JobManager
                 metadata={
-                    'new_records': total_new_records_inserted,
-                    'duplicate_records': total_duplicate_records_skipped,
-                    'failed_validation_records': total_failed_validation_records,
+                    'new_records': total_new_records_inserted_agg,
+                    'duplicate_records': total_duplicate_records_skipped_agg,
+                    'failed_validation_records': total_failed_validation_records_agg,
                     'data_status': data_status
                 }
             )
+            if batch_id: # Final update for the job
+                 await self.job_manager.update_job(
+                    batch_id, status='completed',
+                    final_statistics=final_batch_result.metadata,
+                    # Ensure progress is set to 100 if not already,
+                    # and total_records is accurate if it can be determined.
+                 )
+            return final_batch_result
 
-        except ApplicationException as e: 
-            logger.error(f"Application error during import (batch ID: {batch_id}): {str(e)}", exc_info=True)
+        except (ApplicationException, ExternalApiException, BatchProcessingException) as e: # Catch specific exceptions
+            logger.error(f"Error during streaming import (batch ID: {batch_id}): {str(e)}", exc_info=True)
             if batch_id:
                 await self.job_manager.update_job(batch_id, status='failed', error=str(e))
-            raise
-        except Exception as e:
-            logger.error(f"Unexpected error importing data (batch ID: {batch_id}): {str(e)}", exc_info=True)
+            # Re-raise specific exceptions if they are already suitable for API response
+            # Or wrap in ApplicationException if not.
+            if not isinstance(e, ApplicationException): # Wrap if it's not already one
+                 raise ApplicationException(message=f"Import failed: {str(e)}", cause=e, batch_id=batch_id)
+            else:
+                 raise
+        except Exception as e: # Catch any other unexpected errors
+            logger.error(f"Unexpected error during streaming import (batch ID: {batch_id}): {str(e)}", exc_info=True)
             if batch_id:
                 await self.job_manager.update_job(batch_id, status='failed', error=str(e))
             raise ApplicationException(
                 message=f"Import failed due to unexpected error: {str(e)}",
-                cause=e
+                cause=e,
+                batch_id=batch_id
             )
 
     @timed

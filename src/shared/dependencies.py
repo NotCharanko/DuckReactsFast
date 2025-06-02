@@ -72,15 +72,19 @@ class DependencyContainer:
         """Get the well production repository instance"""
         if 'repository' not in self._instances:
             repo_paths_config = self._config.get('repository_paths', {})
-            data_dir = Path(repo_paths_config.get('data_dir', 'data')) # Default to 'data' if not configured
-            downloads_dir = Path(repo_paths_config.get('downloads_dir', 'downloads')) # Add downloads_dir
-            duckdb_filename = repo_paths_config.get('duckdb_filename', 'wells_production.duckdb')
+            # data_dir = Path(repo_paths_config.get('data_dir', 'data')) # No longer needed here
+            downloads_dir = Path(repo_paths_config.get('downloads_dir', 'downloads'))
+            # duckdb_filename = repo_paths_config.get('duckdb_filename', 'wells_production.duckdb') # No longer needed here
             csv_filename = repo_paths_config.get('csv_filename', 'wells_prod.csv')
+
+            duckdb_connection = self._config.get('duckdb_connection')
+            if not duckdb_connection:
+                raise ValueError("DuckDB connection not found in configuration. Ensure it's set during app startup.")
 
             # Use DuckDBWellProductionRepository instead of CompositeWellProductionRepository
             # This provides fast DuckDB operations for imports and on-demand CSV export
             self._instances['repository'] = DuckDBWellProductionRepository(
-                db_path=data_dir / duckdb_filename,
+                conn=duckdb_connection, # Pass the connection object
                 downloads_dir=downloads_dir,
                 csv_filename=csv_filename
             )
@@ -117,7 +121,12 @@ class DependencyContainer:
     def get_job_manager(self) -> JobManager:
         """Get the job manager instance"""
         if 'job_manager' not in self._instances:
-            self._instances['job_manager'] = JobManager()
+            duckdb_connection = self._config.get('duckdb_connection')
+            if not duckdb_connection:
+                # This ideally should not happen if main.py sets it up correctly
+                # and get_repository() which also uses it, is called first or if the connection is always available.
+                raise ValueError("DuckDB connection not found in configuration for JobManager. Ensure it's set during app startup.")
+            self._instances['job_manager'] = JobManager(db_conn=duckdb_connection)
         return self._instances['job_manager']
 
     # --- Service Getters ---
@@ -135,7 +144,8 @@ class DependencyContainer:
             self._instances['well_production_import_service_instance'] = WellProductionImportService(
                 repository=self.get_repository(),
                 external_api=self.get_external_api_adapter(),
-                job_manager=self.get_job_manager()
+                job_manager=self.get_job_manager(),
+                batch_processor=self.get_batch_processor_instance() # Injected BatchProcessor
             )
         return self._instances['well_production_import_service_instance']
 
@@ -170,7 +180,8 @@ class DependencyContainer:
             self._instances['odata_well_production_import_service_instance'] = ODataWellProductionImportService(
                 odata_api_adapter=self.get_odata_external_api_adapter(),
                 repository=self.get_repository(),
-                job_manager=self.get_job_manager()
+                job_manager=self.get_job_manager(),
+                batch_processor=self.get_batch_processor_instance() # Injected BatchProcessor
             )
         return self._instances['odata_well_production_import_service_instance']
 

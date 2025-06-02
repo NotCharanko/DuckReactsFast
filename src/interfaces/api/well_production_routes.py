@@ -148,10 +148,10 @@ async def trigger_import_well_production(
     """Trigger well production data import with a simple GET request."""
     try:
         # Try to create a new job
-        job_id = await job_manager.create_job()
+        job_id = await job_manager.create_job(job_type="well_import") # Pass job_type
         if not job_id:
             error = BusinessRuleViolationException(
-                message="An import is already in progress. Please wait for it to complete.",
+                message="A 'well_import' job is already in progress. Please wait for it to complete.", # Updated message
                 rule="SINGLE_IMPORT_RULE"
             )
             return ResponseBuilder.error(error, request_id=request_id)
@@ -566,10 +566,10 @@ async def run_odata_import_well_production(
     """
     try:
         # Try to create a new job
-        job_id = await job_manager.create_job()
+        job_id = await job_manager.create_job(job_type="odata_import") # Pass job_type
         if not job_id:
             error = BusinessRuleViolationException(
-                message="An OData import is already in progress. Please wait for it to complete.",
+                message="An 'odata_import' job is already in progress. Please wait for it to complete.", # Updated message
                 rule="SINGLE_ODATA_IMPORT_RULE"
             )
             return ResponseBuilder.error(error, request_id=request_id)

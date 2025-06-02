@@ -1,6 +1,7 @@
 ### main.py
 import logging
 import sys
+import duckdb
 from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -35,6 +36,16 @@ async def lifespan(app: FastAPI):
     logger.info("Starting Well Production API...")
     settings = get_settings()
 
+    # Initialize shared DuckDB connection for the application lifecycle.
+    # The connection is created at startup and closed at shutdown.
+    # This ensures all parts of the application (e.g., repositories, job manager)
+    # use the same database connection, facilitating transaction management (if needed)
+    # and connection pooling by DuckDB itself.
+    db_path = Path(settings.DATA_ROOT_DIR) / settings.DUCKDB_FILENAME
+    db_path.parent.mkdir(parents=True, exist_ok=True) # Ensure data directory exists
+    duckdb_connection = duckdb.connect(str(db_path), read_only=False)
+    logger.info(f"DuckDB connection established to: {db_path}")
+
     app_config = {
         "external_api": {
             "base_url": settings.API_BASE_URL,
@@ -51,10 +62,18 @@ async def lifespan(app: FastAPI):
             "duckdb_filename": settings.DUCKDB_FILENAME,
             "csv_filename": settings.CSV_EXPORT_FILENAME
         },
+        "duckdb_connection": duckdb_connection, # Provide the shared connection to the dependency container
         # Add other configurations like batch_processing if needed
     }
+    # Configure global dependencies, making the app_config (including the db connection)
+    # available to various components.
     configure_dependencies(config=app_config)
-    yield
+
+    yield # Application runs after this point
+
+    # Cleanup: Close the shared DuckDB connection when the application shuts down.
+    logger.info("Closing DuckDB connection...")
+    duckdb_connection.close()
     logger.info("Shutting down Well Production API...")
 
 app = FastAPI(

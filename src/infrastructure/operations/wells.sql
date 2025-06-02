@@ -23,7 +23,6 @@ CREATE TABLE IF NOT EXISTS well_production (
 CREATE INDEX IF NOT EXISTS idx_field_code ON well_production(field_code);
 CREATE INDEX IF NOT EXISTS idx_well_code ON well_production(well_code);
 CREATE INDEX IF NOT EXISTS idx_production_period ON well_production(production_period);
-CREATE INDEX IF NOT EXISTS idx_composite_key ON well_production(well_code, field_code, production_period);
 
 -- name: get_by_well_code
 SELECT * FROM well_production WHERE well_code = ? ORDER BY production_period DESC;
