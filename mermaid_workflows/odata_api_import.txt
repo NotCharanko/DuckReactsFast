@@ -1,0 +1,52 @@
+```mermaid
+graph TD
+    A[Client] --> B{GET /api/v1/wells/import/run};
+    B --> C[ODataWellProductionImportService];
+    C --> D{ODataExternalApiPort};
+    D --> E[ODataExternalApiAdapter];
+    E --> F[External OData API];
+    F -- Fetched Data (Handles Pagination) --> E;
+    E -- Polars DataFrame --> C;
+    C -- Validate & Clean Data (Polars) --> C;
+    C -- WellProduction Entities --> G{WellProductionRepository Port};
+    G --> H[DuckDBWellProductionRepository Impl];
+    H -- Save to --> I[DuckDB Database];
+    C --> J[JobManager];
+    J -- Updates Job Status --> K[jobs.json];
+
+    subgraph "API Interface (src/interfaces/api)"
+        B;
+    end
+
+    subgraph "Application Service (src/application/services)"
+        C;
+    end
+
+    subgraph "Domain Port (src/domain/ports)"
+        D;
+    end
+
+    subgraph "Infrastructure Adapter (src/infrastructure/adapters)"
+        E;
+    end
+
+    subgraph "Domain Repository Port (src/domain/repositories)"
+        G;
+    end
+
+    subgraph "Infrastructure Repository (src/infrastructure/repositories)"
+        H;
+    end
+
+    subgraph "Infrastructure DB (src/infrastructure/db)"
+        I;
+    end
+
+    subgraph "Shared Services (src/shared)"
+        J; K;
+    end
+
+    style A fill:#lightgrey,stroke:#333,stroke-width:2px
+    style F fill:#lightgrey,stroke:#333,stroke-width:2px
+    style C stroke-width:2px,stroke-dasharray: 5 5
+```

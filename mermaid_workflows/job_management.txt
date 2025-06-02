@@ -1,0 +1,36 @@
+```mermaid
+graph TD
+    subgraph "API Triggers & Status Check"
+        A[Client] --> B{GET /api/v1/wells/import/trigger};
+        A --> C{GET /api/v1/wells/import/run};
+        A --> D{GET /api/v1/wells/import/status/{job_id}};
+    end
+
+    subgraph "Import Services"
+        E[WellProductionImportService] -.-> G;
+        F[ODataWellProductionImportService] -.-> G;
+    end
+
+    subgraph "Shared JobManager (src/shared)"
+        G[JobManager];
+        G -- create_job --> G;
+        G -- update_job --> G;
+        G -- get_job_status --> G;
+        G <--> H[jobs.json (Persistence)];
+    end
+
+    B -- Calls create_job --> G;
+    C -- Calls create_job --> G;
+
+    E -- During Import Process --> G;
+    F -- During OData Import Process --> G;
+
+    D -- Calls get_job_status --> G;
+    G -- Job Status Info --> D;
+
+    style A fill:#lightgrey,stroke:#333,stroke-width:2px
+    style H fill:#grey,stroke:#333,stroke-width:2px,stroke-dasharray: 5 5
+
+    classDef importService fill:#f9f,stroke:#333,stroke-width:2px;
+    class E,F importService;
+```

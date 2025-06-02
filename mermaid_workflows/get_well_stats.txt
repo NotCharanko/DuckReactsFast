@@ -1,0 +1,40 @@
+```mermaid
+graph TD
+    A[Client] --> B{GET /api/v1/wells/stats};
+    B --> C[WellProductionQueryService];
+    C -- Get Production Statistics --> D{WellProductionRepository Port};
+    D --> E[DuckDBWellProductionRepository Impl];
+    E -- Aggregates/Queries Data --> F[DuckDB Database];
+    F -- Statistical Data --> E;
+    E -- Statistics --> D;
+    D -- Statistics --> C;
+    C -- Formatted Statistics --> G[API Response];
+    G --> A;
+
+    subgraph "API Interface (src/interfaces/api)"
+        B;
+    end
+
+    subgraph "Application Service (src/application/services)"
+        C;
+    end
+
+    subgraph "Domain Repository Port (src/domain/repositories)"
+        D;
+    end
+
+    subgraph "Infrastructure Repository (src/infrastructure/repositories)"
+        E;
+    end
+
+    subgraph "Infrastructure DB (src/infrastructure/db)"
+        F;
+    end
+
+    subgraph "API Response Handling"
+        G;
+    end
+
+    style A fill:#lightgrey,stroke:#333,stroke-width:2px
+    style F fill:#lightgrey,stroke:#333,stroke-width:2px
+```

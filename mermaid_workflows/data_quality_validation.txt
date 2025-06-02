@@ -1,0 +1,29 @@
+```mermaid
+graph TD
+    A[Application Code / Other Services] --> B[WellProductionService];
+    B -- Calls validate_data_quality with List<WellProduction> --> B;
+    B -- Accesses --> C{WellProduction Entities};
+    B -- Applies Internal Validation Rules --> B;
+    B -- Returns Validation Results (Dict) --> A;
+
+    subgraph "Application Service (src/application/services)"
+        B;
+    end
+
+    subgraph "Domain Entities (src/domain/entities)"
+        C;
+    end
+
+    style A fill:#lightgrey,stroke:#333,stroke-width:2px
+    style C stroke-width:2px,stroke-dasharray: 5 5
+
+    note right of B
+        This service provides internal data quality checks.
+        It is not directly exposed as an API endpoint
+        in well_production_routes.py, but is used
+        internally by other parts of the application
+        (e.g. potentially after data import or before processing).
+        It consumes WellProduction entities and applies
+        business rule validations.
+    endnote
+```
